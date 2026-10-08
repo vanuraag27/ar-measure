@@ -15,16 +15,38 @@ class SoundAndSpeechManager {
     return this.audioCtx;
   }
 
-  // Voice Guidance
-  speak(text: string, enabled: boolean = true) {
+  // Voice Guidance (English or Hindi)
+  private translateToHindi(text: string): string {
+    const map: Record<string, string> = {
+      'Measurement reset.': 'माप रीसेट हो गया।',
+      'Wall set. Now aim at points on the wall.': 'दीवार तय हो गई। अब दीवार पर बिंदुओं पर निशाना लगाइए।',
+      'Start locked.': 'शुरुआती बिंदु लॉक हो गया।',
+      'Base locked. Aim at the top.': 'आधार लॉक हो गया। अब ऊपरी सिरे पर निशाना लगाइए।',
+      'Now aim at the top edge of the object.': 'अब वस्तु के ऊपरी किनारे पर निशाना लगाइए।',
+      'Saved.': 'सेव हो गया।',
+    };
+    if (map[text]) return map[text];
+    const m = /^Point (\d+) added\.$/.exec(text);
+    if (m) return `बिंदु ${m[1]} जोड़ा गया।`;
+    return text;
+  }
+
+  speak(text: string, enabled: boolean = true, language: 'en' | 'hi' = 'en') {
     if (!enabled || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     try {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.05;
+      const synth = window.speechSynthesis;
+      synth.cancel();
+      const hindi = language === 'hi';
+      const utterance = new SpeechSynthesisUtterance(hindi ? this.translateToHindi(text) : text);
+      utterance.lang = hindi ? 'hi-IN' : 'en-US';
+      const voices = synth.getVoices();
+      const prefix = hindi ? 'hi' : 'en';
+      const voice = voices.find(v => v.lang.toLowerCase().replace('_', '-').startsWith(prefix));
+      if (voice) utterance.voice = voice;
+      utterance.rate = hindi ? 0.95 : 1.05;
       utterance.pitch = 1.0;
-      utterance.volume = 0.85;
-      window.speechSynthesis.speak(utterance);
+      utterance.volume = 0.9;
+      synth.speak(utterance);
     } catch (e) {
       console.warn('Speech synthesis unavailable or blocked', e);
     }
