@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, useMemo, ReactNode } from 'react';
 import { MeasurementType, Point3D, LengthUnit, MeasurementRecord, AppSettings } from '../../types';
 import { useCameraAndSensors } from '../../hooks/useCameraAndSensors';
+import { useWebXR } from '../../hooks/useWebXR';
 import {
   Vec3, VerticalPlane, calculateDeltas, calculateAngle3Points, calculatePolygonArea3D,
   calculatePolygonPerimeter, calculatePathLength, minAreaRect, median,
@@ -10,7 +11,7 @@ import { LENGTH_CONVERSIONS, formatArea, formatVolume, formatAngle, formatFeetAn
 import { feedback } from '../../utils/soundAndSpeech';
 import { recognizeObjectsInFrame, DetectedARObject } from '../../utils/aiObjectRecognition';
 import {
-  Undo, RotateCcw, Save, Check, ChevronDown, Crosshair, Sparkles, Move, Ruler, Target,
+  Undo, RotateCcw, Save, Check, ChevronDown, Crosshair, Sparkles, Move, Ruler, Target, ScanLine, X,
 } from 'lucide-react';
 
 interface ARCameraOverlayProps {
@@ -50,6 +51,7 @@ interface Result {
 export function ARCameraOverlay({
   tool, settings, onSaveMeasurement, onFinishRoomScan, onUpdateSettings, topSlot, bottomSlot,
 }: ARCameraOverlayProps) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -57,9 +59,17 @@ export function ARCameraOverlay({
 
   const smoothFactor = settings.smoothingFilter === 'off' ? 1 : settings.smoothingFilter === 'low' ? 0.7 : settings.smoothingFilter === 'high' ? 0.15 : 0.4;
   const {
-    cameraActive, isSimulatedFallback, sensorStatus, basis, depression, jitterDeg,
-    trackingConfidence, lightingCondition, featurePoints, startCamera, requestSensorPermission, aimBy,
+    cameraActive, isSimulatedFallback, sensorStatus,
+    trackingConfidence: sensorConfidence, lightingCondition, featurePoints, startCamera, requestSensorPermission, aimBy,
+    basis: sensorBasis, depression: sensorDepression, jitterDeg: sensorJitter,
   } = useCameraAndSensors(videoRef, { smoothing: smoothFactor });
+  const xr = useWebXR(rootRef);
+  const xrOn = xr.active;
+  const basis = xrOn && xr.basis ? xr.basis : sensorBasis;
+  const depression = xrOn && xr.basis ? -Math.asin(Math.max(-1, Math.min(1, xr.basis.forward.y))) * 180 / Math.PI : sensorDepression;
+  const jitterDeg = xrOn ? 0 : sensorJitter;
+  const trackingConfidence = xrOn ? (xr.tracking && xr.hit ? 'high' : 'low') : sensorConfidence;
+  const vFov = xrOn ? xr.vFovDeg : V_FOV;
 
   // ---- measurement state ----
   const [lockedPoints, setLockedPoints] = useState<Point3D[]>([]);
@@ -86,6 +96,7 @@ export function ARCameraOverlay({
   const recognizingRef = useRef(false);
 
   useEffect(() => { setActiveUnit(settings.defaultLengthUnit); }, [settings.defaultLengthUnit]);
+  useEffect(() => { setLockedPoints([]); setMState('idle'); setVolumeBaseCount(null); setAnchoring(false); }, [xrOn]);
 
   const announce = useCallback((text: string) => feedback.speak(text, settings.enableVoiceGuidance, settings.language), [settings.enableVoiceGuidance, settings.language]);
   const flash = useCallback((msg: string) => {
@@ -105,7 +116,7 @@ export function ARCameraOverlay({
 
   // ---- geometry ----
   const deviceHeight = (settings.deviceHeight ?? 1.4) * settings.calibrationFactor;
-  const camPos: Vec3 = useMemo(() => ({ x: origin.x, y: deviceHeight, z: origin.z }), [origin, deviceHeight]);
+  const camPos: Vec3 = useMemo(() => (xrOn && xr.camPos ? xr.camPos : { x: origin.x, y: deviceHeight, z: origin.z }), [xrOn, xr.camPos, origin, deviceHeight]);
 
   // Which surface does the reticle ray need to hit right now?
   const nearestBase = useCallback((pts: Point3D[]): Point3D | null => {
@@ -119,16 +130,17 @@ export function ARCameraOverlay({
       const near = nearestBase(lockedPoints.slice(0, volumeBaseCount));
       return near ? verticalPlaneThrough(near, camPos) : null;
     }
-    if (tool === 'tape' && tapeSurface === 'wall') return tapeWall;
+    if (tool === 'tape' && tapeSurface === 'wall' && !xrOn) return tapeWall;
     return null;
-  }, [tool, lockedPoints, volumeBaseCount, tapeSurface, tapeWall, camPos, nearestBase]);
+  }, [tool, lockedPoints, volumeBaseCount, tapeSurface, tapeWall, camPos, nearestBase, xrOn]);
 
   const surface: Surface = activePlane ? 'wall' : 'floor';
 
   const hit: Vec3 | null = useMemo(() => {
     if (surface === 'wall' && activePlane) return intersectVerticalPlane(camPos, basis.forward, activePlane);
+    if (xrOn) return xr.hit; // ARCore detected real surface (floor, wall, table...)
     return intersectFloor(camPos, basis.forward, MIN_DEPRESSION);
-  }, [surface, activePlane, camPos, basis]);
+  }, [surface, activePlane, camPos, basis, xrOn, xr.hit]);
 
   // Rolling buffer -> locking uses a median of the last few samples to reject sensor spikes
   const bufferRef = useRef<{ t: number; p: Vec3; s: Surface }[]>([]);
@@ -151,10 +163,11 @@ export function ARCameraOverlay({
 
   const accuracyM = useMemo(() => {
     if (!hit) return null;
+    if (xrOn) return 0.005 + 0.008 * Math.hypot(hit.x - camPos.x, hit.y - camPos.y, hit.z - camPos.z);
     if (surface === 'floor') return estimateFloorError(deviceHeight, depression);
     const d = Math.hypot(hit.x - camPos.x, hit.z - camPos.z);
     return Math.max(0.005, d * 0.006 + 0.01); // ~0.35° pointing noise on a wall at distance d
-  }, [hit, surface, deviceHeight, depression, camPos]);
+  }, [hit, surface, deviceHeight, depression, camPos, xrOn]);
 
   // ---- tool reset ----
   const resetAll = useCallback((silent = false) => {
@@ -431,7 +444,7 @@ export function ARCameraOverlay({
     if (!ctx) return;
     ctx.clearRect(0, 0, w, h);
     const cx = w / 2, cy = h / 2;
-    const proj = (p: Vec3) => projectToScreen(p, camPos, basis, w, h, V_FOV);
+    const proj = (p: Vec3) => projectToScreen(p, camPos, basis, w, h, vFov);
 
     // optical feature points
     if (settings.enableFeaturePoints) {
@@ -561,13 +574,15 @@ export function ARCameraOverlay({
     ctx.moveTo(cx, cy - 30); ctx.lineTo(cx, cy - 22); ctx.moveTo(cx, cy + 30); ctx.lineTo(cx, cy + 22);
     ctx.stroke();
   }, [viewSize, basis, camPos, depression, hit, lockedPoints, mState, tool, featurePoints, detectedObjects, aiVisionEnabled,
-      settings.enableFeaturePoints, settings.enablePlaneVisualization, activeUnit, volumeBaseCount, activePlane, surface, result]);
+      settings.enableFeaturePoints, settings.enablePlaneVisualization, activeUnit, volumeBaseCount, activePlane, surface, result, vFov]);
 
   // ---- UI helpers ----
   const hint: string = (() => {
     if (sensorStatus === 'needs_permission') return 'Tap "Enable motion sensors" to start.';
     if (anchoring) return 'Stand at your new spot, aim at the LAST locked point, tap MATCH.';
+    if (xrOn && !xr.tracking) return 'Move the phone slowly so ARCore can find the surfaces.';
     if (!hit) {
+      if (xrOn) return 'Point at a surface (floor, wall, table) and move slowly.';
       if (surface === 'wall') return 'Aim at the wall you set (face it directly).';
       return depression < MIN_DEPRESSION ? 'Tilt the phone down toward the floor.' : 'Aim at a surface.';
     }
@@ -602,19 +617,19 @@ export function ARCameraOverlay({
   const confColor = trackingConfidence === 'high' ? 'bg-emerald-500' : trackingConfidence === 'medium' ? 'bg-amber-500' : 'bg-rose-500';
 
   return (
-    <div className="flex flex-col w-full h-full min-h-0 bg-slate-950 select-none">
-      {topSlot}
+    <div ref={rootRef} className={`w-full h-full min-h-0 select-none ${xrOn ? 'relative bg-transparent' : 'flex flex-col bg-slate-950'}`}>
+      {xrOn ? <div className="absolute top-0 inset-x-0 z-20 bg-slate-950/80">{topSlot}</div> : topSlot}
 
       {/* ===== Camera viewport (nothing but overlays tied to the camera lives here) ===== */}
       <div
         ref={viewportRef}
-        className="relative flex-1 min-h-[220px] overflow-hidden bg-slate-950 touch-none"
+        className={`overflow-hidden touch-none ${xrOn ? 'absolute inset-0 bg-transparent' : 'relative flex-1 min-h-[220px] bg-slate-950'}`}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
       >
-        <video ref={videoRef} playsInline muted autoPlay className={`absolute inset-0 w-full h-full object-cover ${isSimulatedFallback ? 'opacity-0' : ''}`} />
+        <video ref={videoRef} playsInline muted autoPlay className={`absolute inset-0 w-full h-full object-cover ${isSimulatedFallback || xrOn ? 'opacity-0' : ''}`} />
         {isSimulatedFallback && (
           <div className="absolute inset-0 bg-gradient-to-b from-slate-900 to-slate-950 flex items-start justify-center pt-14">
             <button onClick={startCamera} className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs font-semibold rounded-lg border border-slate-700">
@@ -629,11 +644,20 @@ export function ARCameraOverlay({
           <div className="min-w-0 bg-slate-900/85 backdrop-blur-md border border-slate-800 rounded-xl px-2.5 py-1.5 flex items-center gap-2 pointer-events-auto">
             <span className={`w-2 h-2 rounded-full shrink-0 ${confColor}`} />
             <span className="text-[11px] font-medium text-slate-200 truncate">
-              {surface === 'wall' ? 'Wall' : 'Floor'}{hit && accuracyM !== null ? ` · ±${(accuracyM * 100).toFixed(accuracyM < 0.1 ? 1 : 0)} cm` : ' · no target'}
+              {xrOn ? 'ARCore' : surface === 'wall' ? 'Wall' : 'Floor'}{hit && accuracyM !== null ? ` · ±${(accuracyM * 100).toFixed(accuracyM < 0.1 ? 1 : 0)} cm` : ' · no target'}
             </span>
             <span className="text-[10px] text-slate-500 capitalize shrink-0">{trackingConfidence}</span>
           </div>
           <div className="flex items-center gap-1.5 pointer-events-auto shrink-0">
+            {(xr.supported || xrOn) && (
+              <button
+                onClick={() => (xrOn ? xr.stop() : xr.start())}
+                title="Precise AR (ARCore)"
+                className={`h-8 px-2.5 rounded-xl border text-[11px] font-bold flex items-center gap-1 backdrop-blur-md ${xrOn ? 'bg-emerald-500 text-slate-950 border-emerald-400' : 'bg-slate-900/85 text-emerald-400 border-emerald-500/50'}`}
+              >
+                {xrOn ? <X className="w-3.5 h-3.5" /> : <ScanLine className="w-3.5 h-3.5" />}{xrOn ? 'Exit' : 'Precise AR'}
+              </button>
+            )}
             <button
               onClick={() => setAiVisionEnabled(v => !v)}
               title="AI labels (suggestions only, not used for measuring)"
@@ -660,14 +684,14 @@ export function ARCameraOverlay({
         </div>
 
         {/* sensor permission / no-sensor notices */}
-        {sensorStatus === 'needs_permission' && (
+        {!xrOn && sensorStatus === 'needs_permission' && (
           <div className="absolute inset-0 flex items-center justify-center bg-slate-950/70 z-20">
             <button onClick={requestSensorPermission} className="px-5 py-3 bg-amber-500 text-slate-950 font-bold text-sm rounded-2xl shadow-xl">
               Enable motion sensors
             </button>
           </div>
         )}
-        {sensorStatus === 'unavailable' && (
+        {!xrOn && sensorStatus === 'unavailable' && (
           <div className="absolute top-12 left-2 right-2 flex justify-center pointer-events-none">
             <div className="bg-slate-900/90 border border-amber-500/40 text-amber-300 text-[11px] rounded-lg px-2.5 py-1 flex items-center gap-1.5">
               <Move className="w-3 h-3" /> No motion sensors - drag the view to aim (preview only; use a phone for real measuring)
@@ -686,7 +710,7 @@ export function ARCameraOverlay({
       </div>
 
       {/* ===== Control panel (solid, below camera - never covers it) ===== */}
-      <div className="shrink-0 bg-slate-950 border-t border-slate-800 px-3 pt-2 pb-2.5 space-y-2">
+      <div className={`px-3 pt-2 pb-2.5 space-y-2 border-t border-slate-800 ${xrOn ? 'absolute bottom-0 inset-x-0 z-20 bg-slate-950/85' : 'shrink-0 bg-slate-950'}`}>
         {/* Readout */}
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
@@ -707,12 +731,12 @@ export function ARCameraOverlay({
           <div className="flex items-center gap-2 overflow-x-auto [scrollbar-width:none]">
             {tool === 'tape' && (
               <>
-                <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-0.5 shrink-0">
+                {!xrOn && <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-0.5 shrink-0">
                   {(['floor', 'wall'] as const).map(s => (
                     <button key={s} onClick={() => { setTapeSurface(s); resetAll(true); }}
                       className={`px-2.5 py-1 text-[11px] font-semibold rounded-lg capitalize ${tapeSurface === s ? 'bg-amber-500 text-slate-950' : 'text-slate-400'}`}>{s}</button>
                   ))}
-                </div>
+                </div>}
                 <div className="flex bg-slate-900 border border-slate-800 rounded-xl p-0.5 shrink-0">
                   {(['3d', 'horizontal', 'vertical'] as const).map(m => (
                     <button key={m} onClick={() => setProjectionMode(m)}
@@ -729,7 +753,7 @@ export function ARCameraOverlay({
                 <Ruler className="w-3 h-3" /> CAL
               </button>
             )}
-            {lockedPoints.length > 0 && mState === 'measuring' && surface === 'floor' && !anchoring && tool !== 'height' && (
+            {lockedPoints.length > 0 && mState === 'measuring' && surface === 'floor' && !xrOn && !anchoring && tool !== 'height' && (
               <button onClick={startAnchor} className="shrink-0 px-2.5 py-1 text-[11px] rounded-xl bg-slate-900 border border-slate-800 text-slate-300 flex items-center gap-1">
                 <Target className="w-3 h-3" /> I moved
               </button>
@@ -777,7 +801,7 @@ export function ARCameraOverlay({
         </div>
       </div>
 
-      {bottomSlot}
+      {!xrOn && bottomSlot}
 
       {/* Save modal */}
       {showSaveModal && (
