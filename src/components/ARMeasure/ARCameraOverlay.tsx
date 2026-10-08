@@ -87,7 +87,7 @@ export function ARCameraOverlay({
 
   useEffect(() => { setActiveUnit(settings.defaultLengthUnit); }, [settings.defaultLengthUnit]);
 
-  const announce = useCallback((text: string) => feedback.speak(text, settings.enableVoiceGuidance), [settings.enableVoiceGuidance]);
+  const announce = useCallback((text: string) => feedback.speak(text, settings.enableVoiceGuidance, settings.language), [settings.enableVoiceGuidance, settings.language]);
   const flash = useCallback((msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast(null), 2600);
